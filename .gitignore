@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Сборка
+build/
+dist/
+*.spec
+*.exe
+# Редакторы и система
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

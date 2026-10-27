@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "WinIsland: загрузки",
+  "version": "1.0.0",
+  "description": "Передаёт прогресс загрузок браузера в WinIsland (Dynamic Island для Windows).",
+  "permissions": ["downloads"],
+  "host_permissions": ["http://127.0.0.1:47831/*"],
+  "background": { "service_worker": "background.js" }
+}

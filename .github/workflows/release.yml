@@ -1,0 +1,39 @@
+name: Сборка WinIsland.exe
+# Запускается, когда вы создаёте метку версии, например v2.0.0
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Сборка exe
+        run: >
+          pyinstaller --noconsole --onefile --name WinIsland
+          --collect-all winrt
+          --collect-submodules pycaw --collect-submodules comtypes
+          --hidden-import screen_brightness_control
+          island.py
+      - name: Архив для скачивания
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pack | Out-Null
+          Copy-Item dist\WinIsland.exe pack\
+          Copy-Item -Recurse browser_extension pack\browser_extension
+          Copy-Item README.md pack\
+          Compress-Archive -Path pack\* -DestinationPath WinIsland-windows.zip
+      - name: Публикация релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WinIsland-windows.zip
+          generate_release_notes: true
