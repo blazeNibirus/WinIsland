@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-WinIsland 2.0 — «Dynamic Island» для Windows 10/11 в стиле Apple.
+WinIsland 2.1 — «Dynamic Island» для Windows 10/11 в стиле Apple.
 
-Возможности:
-  * остров (капсула) или чёлка как на iPhone 13 (с динамиком и камерой) — выбирается в меню в трее;
-  * плеер: обложка, название, перемотка, пауза, следующий/предыдущий трек;
-  * время, дата, погода (клик по погоде — выбор города с поиском);
-  * уведомления Windows (Telegram, WhatsApp, почта и т.д.) показываются в острове;
-  * загрузки файлов: процент, скорость, красивое исчезновение после 100%;
-  * быстрые настройки: Wi-Fi, Bluetooth, режим полёта, громкость, яркость;
-  * полка для файлов: перетащи файл на остров — потом вытащи обратно;
-  * остров закрывается через N секунд после ухода мыши (по умолчанию 10).
+Раскрытый остров = панель вкладок сверху + содержимое:
+  [ Медиа ] [ Быстрые настройки ] [ Таймер / Секундомер ] [ Заметки ]
+
+Ещё умеет:
+  * остров (капсула) или чёлка как на iPhone 13 (с динамиком и камерой);
+  * уведомления Windows (Telegram, WhatsApp, почта…) как баннер в острове;
+  * таймер и секундомер (в свёрнутом острове — мини-таймер);
+  * загрузки файлов с процентом, погода с выбором города, полка для файлов;
+  * скрывается, когда открыто полноэкранное приложение (настройка в трее).
 """
 
 import sys
@@ -24,6 +24,7 @@ import datetime
 import tempfile
 import shutil
 import sqlite3
+import subprocess
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -36,7 +37,7 @@ from PyQt6.QtGui import (QPainter, QColor, QPainterPath, QFont, QPixmap, QPen, Q
                          QGuiApplication, QCursor, QIcon, QAction, QActionGroup)
 from PyQt6.QtWidgets import (QApplication, QWidget, QSystemTrayIcon, QMenu, QFileIconProvider,
                              QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QPushButton)
+                             QListWidgetItem, QPushButton, QTextEdit)
 
 # ---- плеер Windows (System Media Transport Controls) ----
 WINRT_ERROR = ""
@@ -63,7 +64,6 @@ except Exception as _e:  # noqa
 # =====================================================================
 TOP_MARGIN = 6            # отступ капсулы от верхнего края экрана
 HOVER_OPEN_DELAY = 0.25   # через сколько секунд наведения остров раскрывается
-HIDE_IN_FULLSCREEN = True # прятать остров, если открыто полноэкранное окно
 DL_PORT = 47831           # порт для расширения браузера (загрузки)
 EXTRA_WATCH_DIRS = []     # дополнительные папки для слежения за загрузками, например [r"D:\Загрузки"]
 
@@ -71,7 +71,9 @@ EXTRA_WATCH_DIRS = []     # дополнительные папки для сл�
 W_IDLE, H_IDLE = 150, 36
 W_IDLE_NOTCH = 214
 W_MEDIA, H_MEDIA = 236, 38
-W_EXP, H_EXP = 440, 226
+W_CTIMER, H_CTIMER = 180, 38
+T0 = 56                   # где начинается содержимое вкладки (под панелью вкладок)
+W_EXP, H_EXP = 440, 246   # вкладка «Медиа»
 SHELF_H = 96
 DL_H = 52
 W_DROP, H_DROP = 440, 116
@@ -80,7 +82,8 @@ W_DL, H_DL = 340, 52
 FLARE = 14                # «плечи» чёлки по бокам
 
 APP_NAME = "WinIsland"
-LAYERS = ("idle", "media", "expanded", "drop", "quick", "notif", "download")
+TABS = ("media", "quick", "timer", "notes")
+LAYERS = ("idle", "media", "ctimer", "expanded", "drop", "notif", "download")
 
 AL = Qt.AlignmentFlag
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -88,10 +91,17 @@ MONTHS = ["января", "февраля", "марта", "апреля", "ма�
           "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 PARTIAL_EXT = (".crdownload", ".part", ".opdownload", ".download", ".partial", ".aria2", ".tdownload")
 
+ORANGE = (255, 159, 10)
+GREEN = (48, 209, 88)
+RED = (255, 69, 58)
+BLUE = (10, 132, 255)
+
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
+NOTES_PATH = os.path.join(SETTINGS_DIR, "notes.json")
 DEFAULT_SETTINGS = {"style": "island", "notch_decor": True, "close_delay": 10,
-                    "notifications": True, "downloads": True, "city": None}
+                    "notifications": True, "downloads": True, "city": None,
+                    "hide_fullscreen": True}
 
 
 class Settings:
@@ -116,6 +126,141 @@ class Settings:
             pass
 
 
+class NoteStore:
+    """Заметки хранятся в файле notes.json (старые — первыми)."""
+
+    def __init__(self, path=None):
+        self.path = path or NOTES_PATH
+        self.items = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.items = [str(x) for x in data]
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.items, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def add(self, text):
+        self.items.append(text)
+        self.save()
+
+    def update(self, idx, text):
+        if 0 <= idx < len(self.items):
+            self.items[idx] = text
+            self.save()
+
+    def remove(self, idx):
+        if 0 <= idx < len(self.items):
+            del self.items[idx]
+            self.save()
+
+    def rev(self):
+        """[(индекс, текст)] — самые новые сверху."""
+        return [(i, self.items[i]) for i in range(len(self.items) - 1, -1, -1)]
+
+
+class ClockTools:
+    """Таймер и секундомер (чистая логика, без рисования)."""
+
+    def __init__(self):
+        self.mode = "timer"          # какой вид открыт: timer | sw
+        self.t_dur = 300.0
+        self.t_state = "idle"        # idle | running | paused
+        self.t_end = 0.0
+        self.t_left = 300.0
+        self.sw_state = "idle"       # idle | running | stopped
+        self.sw_start = 0.0
+        self.sw_acc = 0.0
+        self.laps = []
+
+    # --- таймер ---
+    def t_remaining(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.t_state == "running":
+            return max(0.0, self.t_end - now)
+        if self.t_state == "paused":
+            return self.t_left
+        return self.t_dur
+
+    def t_adjust(self, delta_min):
+        if self.t_state == "idle":
+            self.t_dur = float(max(60, min(99 * 3600, self.t_dur + delta_min * 60)))
+
+    def t_set(self, minutes):
+        if self.t_state == "idle":
+            self.t_dur = float(minutes * 60)
+
+    def t_start(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.t_state == "idle":
+            self.t_left = self.t_dur
+        self.t_end = now + self.t_left
+        self.t_state = "running"
+
+    def t_pause(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.t_state == "running":
+            self.t_left = max(0.0, self.t_end - now)
+            self.t_state = "paused"
+
+    def t_cancel(self):
+        self.t_state = "idle"
+
+    def t_check(self, now=None):
+        """True один раз — в момент, когда таймер дошёл до нуля."""
+        now = time.monotonic() if now is None else now
+        if self.t_state == "running" and now >= self.t_end:
+            self.t_state = "idle"
+            return True
+        return False
+
+    # --- секундомер ---
+    def sw_elapsed(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.sw_state == "running":
+            return self.sw_acc + (now - self.sw_start)
+        return self.sw_acc
+
+    def sw_toggle(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.sw_state == "running":
+            self.sw_acc += now - self.sw_start
+            self.sw_state = "stopped"
+        else:
+            self.sw_start = now
+            self.sw_state = "running"
+
+    def sw_secondary(self, now=None):
+        """Пока идёт — «Круг», когда остановлен — «Сброс»."""
+        now = time.monotonic() if now is None else now
+        if self.sw_state == "running":
+            self.laps.append(self.sw_elapsed(now))
+        elif self.sw_acc > 0 or self.sw_state == "stopped":
+            self.sw_state = "idle"
+            self.sw_acc = 0.0
+            self.laps = []
+
+    # --- общее ---
+    def active(self):
+        return self.t_state in ("running", "paused") or self.sw_state == "running"
+
+    def mini_text(self, now=None):
+        now = time.monotonic() if now is None else now
+        if self.t_state in ("running", "paused"):
+            return fmt_clock(math.ceil(self.t_remaining(now) - 1e-6))
+        if self.sw_state == "running":
+            return fmt_clock(int(self.sw_elapsed(now)))
+        return ""
+
+
 # =====================================================================
 #                           Вспомогательное
 # =====================================================================
@@ -132,6 +277,26 @@ def fmt_time(sec):
     return "%d:%02d" % (m, s)
 
 
+def fmt_clock(sec):
+    """Для таймера: 05:00 или 1:05:00."""
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "%d:%02d:%02d" % (h, m, s)
+    return "%02d:%02d" % (m, s)
+
+
+def fmt_sw(sec):
+    """Для секундомера: 01:23,45."""
+    sec = max(0.0, float(sec))
+    total_cs = int(sec * 100)
+    cs = total_cs % 100
+    s = (total_cs // 100) % 60
+    m = total_cs // 6000
+    return "%02d:%02d,%02d" % (m, s, cs)
+
+
 def fmt_size(n):
     n = float(max(0, n))
     for unit in ("Б", "КБ", "МБ", "ГБ"):
@@ -140,6 +305,14 @@ def fmt_size(n):
             return s.replace(".", ",") + " " + unit
         n /= 1024.0
     return "0 Б"
+
+
+def lerp_color(a, b, t):
+    t = max(0.0, min(1.0, t))
+    return QColor(int(a.red() + (b.red() - a.red()) * t),
+                  int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t),
+                  int(a.alpha() + (b.alpha() - a.alpha()) * t))
 
 
 def weather_info(code, is_day):
@@ -194,7 +367,8 @@ def app_label(pid):
              ("viber", "Viber"), ("skype", "Skype"), ("slack", "Slack"), ("spotify", "Spotify"),
              ("yandex", "Яндекс"), ("chrome", "Chrome"), ("msedge", "Edge"), ("edge", "Edge"),
              ("firefox", "Firefox"), ("outlook", "Outlook"), ("mail", "Почта"),
-             ("vk", "VK"), ("steam", "Steam"), ("teams", "Teams"), ("zoom", "Zoom")]
+             ("powershell", "Windows"), ("vk", "VK"), ("steam", "Steam"), ("teams", "Teams"),
+             ("zoom", "Zoom")]
     for key, name in known:
         if key in low:
             return name
@@ -236,8 +410,45 @@ def parse_toast(payload):
     return title, body, img
 
 
+TEST_TOAST_PS = (
+    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+    "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
+    "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+    "$n = $t.GetElementsByTagName('text');"
+    "$n.Item(0).AppendChild($t.CreateTextNode('WinIsland тест')) > $null;"
+    "$n.Item(1).AppendChild($t.CreateTextNode('Если вы видите это в острове — уведомления работают')) > $null;"
+    "$toast = [Windows.UI.Notifications.ToastNotification]::new($t);"
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+    "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast)"
+)
+
+
+def send_test_toast():
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", TEST_TOAST_PS],
+                         creationflags=0x08000000)
+    except Exception as ex:
+        print("[WinIsland] тестовое уведомление:", ex)
+
+
+def beep_alarm():
+    """Звук окончания таймера (системный сигнал Windows), в отдельном потоке."""
+    def run():
+        try:
+            import ctypes
+            for _ in range(4):
+                ctypes.windll.user32.MessageBeep(0x40)
+                time.sleep(0.8)
+        except Exception:
+            pass
+    if sys.platform == "win32":
+        threading.Thread(target=run, daemon=True).start()
+
+
 # =====================================================================
-#                     Шрифты и значки (рисуем сами)
+#                Шрифты и значки в стиле SF Symbols (рисуем сами)
 # =====================================================================
 def F(px, weight=QFont.Weight.Normal):
     f = QFont()
@@ -254,13 +465,6 @@ def EF(px):
     return f
 
 
-def SF(px):
-    f = QFont()
-    f.setFamilies(["Segoe UI Symbol", "Segoe UI", "Arial"])
-    f.setPixelSize(px)
-    return f
-
-
 def draw_text(p, rect, s, font, color, align=AL.AlignLeft | AL.AlignVCenter, elide=True):
     p.setFont(font)
     p.setPen(color)
@@ -269,13 +473,18 @@ def draw_text(p, rect, s, font, color, align=AL.AlignLeft | AL.AlignVCenter, eli
     p.drawText(rect, align, s)
 
 
-def _poly(p, pts, color):
+def _stroke(p, color, w=1.8):
+    p.setPen(QPen(color, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+
+def _poly(p, pts, color, width=3.0):
     path = QPainterPath()
     path.moveTo(pts[0][0], pts[0][1])
     for q in pts[1:]:
         path.lineTo(q[0], q[1])
     path.closeSubpath()
-    p.setPen(QPen(color, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setPen(QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
     p.setBrush(color)
     p.drawPath(path)
 
@@ -327,19 +536,83 @@ def icon_bt(p, cx, cy, color):
     path.moveTo(cx + pts[0][0], cy + pts[0][1])
     for q in pts[1:]:
         path.lineTo(cx + q[0], cy + q[1])
-    p.setPen(QPen(color, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-    p.setBrush(Qt.BrushStyle.NoBrush)
+    _stroke(p, color, 2.4)
     p.drawPath(path)
 
 
-def icon_gear(p, cx, cy, color):
-    """Значок «ползунки» для кнопки быстрых настроек."""
-    p.setPen(QPen(color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-    p.drawLine(QPointF(cx - 7, cy - 4), QPointF(cx + 7, cy - 4))
-    p.drawLine(QPointF(cx - 7, cy + 4), QPointF(cx + 7, cy + 4))
+def icon_airplane(p, cx, cy, color):
+    pts = [(0, -10), (2, -4.5), (10, 1.5), (10, 4), (2, 2), (1.4, 7.5), (4.2, 9.3), (4.2, 10.8),
+           (0, 9.8), (-4.2, 10.8), (-4.2, 9.3), (-1.4, 7.5), (-2, 2), (-10, 4), (-10, 1.5), (-2, -4.5)]
+    p.save()
+    p.translate(cx, cy)
+    p.rotate(45)
+    _poly(p, pts, color, 1.4)
+    p.restore()
+
+
+def icon_speaker(p, cx, cy, color, muted=False):
+    p.save()
+    p.translate(cx, cy)
+    _poly(p, [(-9, -3.2), (-5, -3.2), (0.5, -8), (0.5, 8), (-5, 3.2), (-9, 3.2)], color, 1.6)
+    if muted:
+        _stroke(p, color, 1.9)
+        p.drawLine(QPointF(-10, -10), QPointF(10, 10))
+    else:
+        _stroke(p, color, 1.8)
+        for r in (5, 9):
+            p.drawArc(QRectF(1.5 - r, -r, 2 * r, 2 * r), -45 * 16, 90 * 16)
+    p.restore()
+
+
+def icon_sun(p, cx, cy, color):
+    p.save()
+    p.translate(cx, cy)
+    p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(color)
-    p.drawEllipse(QPointF(cx - 2.5, cy - 4), 2.6, 2.6)
-    p.drawEllipse(QPointF(cx + 3, cy + 4), 2.6, 2.6)
+    p.drawEllipse(QPointF(0, 0), 4.2, 4.2)
+    _stroke(p, color, 1.8)
+    for i in range(8):
+        a = i * math.pi / 4
+        p.drawLine(QPointF(7 * math.cos(a), 7 * math.sin(a)), QPointF(10 * math.cos(a), 10 * math.sin(a)))
+    p.restore()
+
+
+def icon_tab_media(p, cx, cy, color):
+    _stroke(p, color, 1.8)
+    path = QPainterPath()
+    path.moveTo(cx + 2.5, cy + 4.5)
+    path.lineTo(cx + 2.5, cy - 7)
+    path.cubicTo(cx + 2.5, cy - 4.2, cx + 7, cy - 4.8, cx + 7, cy - 1.0)
+    p.drawPath(path)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(cx - 0.5, cy + 5), 3.4, 2.7)
+
+
+def icon_tab_quick(p, cx, cy, color):
+    _stroke(p, color, 1.8)
+    p.drawLine(QPointF(cx - 8, cy - 4.5), QPointF(cx + 8, cy - 4.5))
+    p.drawLine(QPointF(cx - 8, cy + 4.5), QPointF(cx + 8, cy + 4.5))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QPointF(cx - 3, cy - 4.5), 3.0, 3.0)
+    p.drawEllipse(QPointF(cx + 3.5, cy + 4.5), 3.0, 3.0)
+
+
+def icon_tab_timer(p, cx, cy, color):
+    _stroke(p, color, 1.8)
+    p.drawEllipse(QPointF(cx, cy + 1.5), 7, 7)
+    p.drawLine(QPointF(cx - 2.5, cy - 8.3), QPointF(cx + 2.5, cy - 8.3))
+    p.drawLine(QPointF(cx, cy + 1.5), QPointF(cx + 3, cy - 1.5))
+    p.drawLine(QPointF(cx + 5.8, cy - 4.8), QPointF(cx + 7.4, cy - 6.4))
+
+
+def icon_tab_notes(p, cx, cy, color):
+    _stroke(p, color, 1.8)
+    p.drawRoundedRect(QRectF(cx - 6.5, cy - 8, 13, 16), 3, 3)
+    p.drawLine(QPointF(cx - 3, cy - 3), QPointF(cx + 3, cy - 3))
+    p.drawLine(QPointF(cx - 3, cy + 1), QPointF(cx + 3, cy + 1))
+    p.drawLine(QPointF(cx - 3, cy + 5), QPointF(cx + 0.5, cy + 5))
 
 
 # =====================================================================
@@ -515,7 +788,7 @@ class Weather(QObject):
 
     @staticmethod
     def _get(url):
-        req = urllib.request.Request(url, headers={"User-Agent": "WinIsland/2.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "WinIsland/2.1"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read().decode("utf-8"))
 
@@ -602,9 +875,12 @@ class NotifWatcher(QObject):
     def _run(self):
         base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Notifications")
         db = os.path.join(base, "wpndatabase.db")
+        print("[WinIsland] база уведомлений Windows:", db,
+              "— найдена" if os.path.exists(db) else "— НЕ найдена")
         tmp = tempfile.mkdtemp(prefix="winisland_")
         last_id = None
         last_sig = None
+        warned = False
         while True:
             try:
                 if os.path.exists(db):
@@ -612,12 +888,18 @@ class NotifWatcher(QObject):
                                 for s in ("", "-wal"))
                     if sig != last_sig:
                         last_sig = sig
+                        first = last_id is None
                         last_id, items = self._read(db, tmp, last_id)
+                        if first:
+                            print("[WinIsland] слежу за уведомлениями, последний номер:", last_id)
                         for it in items:
+                            print("[WinIsland] уведомление:", it["app"], "|", it["title"])
                             self.arrived.emit(it)
-            except Exception:
-                pass
-            time.sleep(1.0)
+            except Exception as ex:
+                if not warned:
+                    warned = True
+                    print("[WinIsland] не удалось прочитать уведомления:", ex)
+            time.sleep(0.7)
 
 
 # =====================================================================
@@ -1024,43 +1306,109 @@ class BrightnessCtl:
 
 
 # =====================================================================
-#                        Окно выбора города
+#                 Всплывающие окна (город, заметки)
 # =====================================================================
-class CityPicker(QWidget):
+POPUP_CSS = """
+    QLabel{color:white;font-family:'Segoe UI Variable Display','Segoe UI';font-size:17px;font-weight:600;}
+    QLabel#hint{color:#8e8e93;font-size:13px;font-weight:400;}
+    QLineEdit, QTextEdit{background:#1c1c1e;color:white;border:1px solid #2c2c2e;border-radius:14px;
+              padding:10px 12px;font-size:15px;selection-background-color:#0a84ff;
+              font-family:'Segoe UI Variable Display','Segoe UI';}
+    QListWidget{background:transparent;border:none;color:white;font-size:14px;outline:0;
+                font-family:'Segoe UI Variable Display','Segoe UI';}
+    QListWidget::item{padding:9px 12px;border-radius:10px;}
+    QListWidget::item:hover{background:#1c1c1e;}
+    QListWidget::item:selected{background:#0a84ff;color:white;}
+    QPushButton{background:#1c1c1e;color:#0a84ff;border:none;border-radius:14px;
+                padding:10px;font-size:14px;font-weight:600;
+                font-family:'Segoe UI Variable Display','Segoe UI';}
+    QPushButton:hover{background:#2c2c2e;}
+    QPushButton#x{color:#8e8e93;padding:2px 8px;border-radius:12px;font-size:13px;}
+    QPushButton#danger{color:#ff453a;}
+    QPushButton#primary{background:#0a84ff;color:white;}
+    QPushButton#primary:hover{background:#3d9bff;}
+"""
+
+
+class PopupCard(QWidget):
+    """Тёмная карточка с плавным появлением (для выбора города и заметок)."""
+
+    def __init__(self, w, h):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                         | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.resize(w, h)
+        self.setStyleSheet(POPUP_CSS)
+        self._anim = None
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 28, 28)
+        p.fillPath(path, QColor(0, 0, 0))
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.drawPath(path)
+        p.end()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.fade_out()
+        else:
+            super().keyPressEvent(e)
+
+    def on_open(self):
+        pass
+
+    def open_animated(self, cx, top):
+        scr = QGuiApplication.primaryScreen().geometry()
+        x = max(scr.x() + 8, min(cx - self.width() // 2, scr.x() + scr.width() - self.width() - 8))
+        y = top
+        self.on_open()
+        self.move(x, y - 18)
+        self.setWindowOpacity(0.0)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        a1 = QPropertyAnimation(self, b"pos")
+        a1.setDuration(420)
+        a1.setStartValue(QPoint(x, y - 18))
+        a1.setEndValue(QPoint(x, y))
+        a1.setEasingCurve(QEasingCurve.Type.OutCubic)
+        a2 = QPropertyAnimation(self, b"windowOpacity")
+        a2.setDuration(280)
+        a2.setStartValue(0.0)
+        a2.setEndValue(1.0)
+        g = QParallelAnimationGroup(self)
+        g.addAnimation(a1)
+        g.addAnimation(a2)
+        self._anim = g
+        g.start()
+
+    def fade_out(self):
+        a = QPropertyAnimation(self, b"windowOpacity")
+        a.setDuration(200)
+        a.setStartValue(self.windowOpacity())
+        a.setEndValue(0.0)
+        a.setEasingCurve(QEasingCurve.Type.InCubic)
+        a.finished.connect(self.hide)
+        self._anim = a
+        a.start()
+
+
+class CityPicker(PopupCard):
     chosen = pyqtSignal(float, float, str)
     auto = pyqtSignal()
     results_ready = pyqtSignal(object, str)
 
     def __init__(self):
-        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
-                         | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.resize(380, 380)
+        super().__init__(380, 380)
         self._q = ""
-        self._anim = None
-        self.setStyleSheet("""
-            QLabel{color:white;font-family:'Segoe UI Variable Display','Segoe UI';font-size:17px;font-weight:600;}
-            QLabel#hint{color:#8e8e93;font-size:13px;font-weight:400;}
-            QLineEdit{background:#1c1c1e;color:white;border:1px solid #2c2c2e;border-radius:12px;
-                      padding:10px 12px;font-size:15px;selection-background-color:#0a84ff;
-                      font-family:'Segoe UI Variable Display','Segoe UI';}
-            QListWidget{background:transparent;border:none;color:white;font-size:14px;outline:0;
-                        font-family:'Segoe UI Variable Display','Segoe UI';}
-            QListWidget::item{padding:9px 12px;border-radius:10px;}
-            QListWidget::item:hover{background:#1c1c1e;}
-            QListWidget::item:selected{background:#0a84ff;color:white;}
-            QPushButton{background:#1c1c1e;color:#0a84ff;border:none;border-radius:12px;
-                        padding:10px;font-size:14px;font-weight:600;
-                        font-family:'Segoe UI Variable Display','Segoe UI';}
-            QPushButton:hover{background:#2c2c2e;}
-            QPushButton#x{color:#8e8e93;padding:2px 8px;border-radius:12px;font-size:13px;}
-        """)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 16, 20, 18)
         lay.setSpacing(10)
         head = QHBoxLayout()
-        title = QLabel("Город для погоды")
-        head.addWidget(title)
+        head.addWidget(QLabel("Город для погоды"))
         head.addStretch(1)
         xb = QPushButton("✕")
         xb.setObjectName("x")
@@ -1088,59 +1436,11 @@ class CityPicker(QWidget):
         self.list.itemActivated.connect(self._pick)
         self.results_ready.connect(self._on_results)
 
-    def paintEvent(self, _e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 26, 26)
-        p.fillPath(path, QColor(0, 0, 0))
-        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
-        p.drawPath(path)
-        p.end()
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape:
-            self.fade_out()
-        else:
-            super().keyPressEvent(e)
-
-    def open_animated(self, cx, top):
-        scr = QGuiApplication.primaryScreen().geometry()
-        x = max(scr.x() + 8, min(cx - self.width() // 2, scr.x() + scr.width() - self.width() - 8))
-        y = top
+    def on_open(self):
         self.search.clear()
         self.list.clear()
         self.hint.setText("Например: Казань, Минск, Алматы")
-        self.move(x, y - 18)
-        self.setWindowOpacity(0.0)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.search.setFocus()
-        a1 = QPropertyAnimation(self, b"pos")
-        a1.setDuration(380)
-        a1.setStartValue(QPoint(x, y - 18))
-        a1.setEndValue(QPoint(x, y))
-        a1.setEasingCurve(QEasingCurve.Type.OutCubic)
-        a2 = QPropertyAnimation(self, b"windowOpacity")
-        a2.setDuration(260)
-        a2.setStartValue(0.0)
-        a2.setEndValue(1.0)
-        g = QParallelAnimationGroup(self)
-        g.addAnimation(a1)
-        g.addAnimation(a2)
-        self._anim = g
-        g.start()
-
-    def fade_out(self):
-        a = QPropertyAnimation(self, b"windowOpacity")
-        a.setDuration(180)
-        a.setStartValue(self.windowOpacity())
-        a.setEndValue(0.0)
-        a.setEasingCurve(QEasingCurve.Type.InCubic)
-        a.finished.connect(self.hide)
-        self._anim = a
-        a.start()
+        QTimer.singleShot(60, self.search.setFocus)
 
     def _start_search(self):
         q = self.search.text().strip()
@@ -1156,7 +1456,7 @@ class CityPicker(QWidget):
         try:
             url = ("https://geocoding-api.open-meteo.com/v1/search?name=%s&count=8&language=ru&format=json"
                    % urllib.parse.quote(q))
-            req = urllib.request.Request(url, headers={"User-Agent": "WinIsland/2.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "WinIsland/2.1"})
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8"))
             self.results_ready.emit(data.get("results") or [], q)
@@ -1196,6 +1496,60 @@ class CityPicker(QWidget):
         self.fade_out()
 
 
+class NoteEditor(PopupCard):
+    saved = pyqtSignal(int, str)
+    deleted = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__(380, 320)
+        self._idx = -1
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 18)
+        lay.setSpacing(10)
+        head = QHBoxLayout()
+        self.title = QLabel("Новая заметка")
+        head.addWidget(self.title)
+        head.addStretch(1)
+        xb = QPushButton("✕")
+        xb.setObjectName("x")
+        xb.clicked.connect(self.fade_out)
+        head.addWidget(xb)
+        lay.addLayout(head)
+        self.edit = QTextEdit()
+        self.edit.setPlaceholderText("Что записать?")
+        self.edit.setAcceptRichText(False)
+        lay.addWidget(self.edit, 1)
+        row = QHBoxLayout()
+        self.btn_del = QPushButton("Удалить")
+        self.btn_del.setObjectName("danger")
+        self.btn_del.clicked.connect(self._delete)
+        row.addWidget(self.btn_del)
+        row.addStretch(1)
+        ok = QPushButton("Готово")
+        ok.setObjectName("primary")
+        ok.clicked.connect(self._save)
+        row.addWidget(ok)
+        lay.addLayout(row)
+
+    def open_for(self, idx, text, cx, top):
+        self._idx = idx
+        self.title.setText("Заметка" if idx >= 0 else "Новая заметка")
+        self.edit.setPlainText(text)
+        self.btn_del.setVisible(idx >= 0)
+        self.open_animated(cx, top)
+
+    def on_open(self):
+        QTimer.singleShot(60, self.edit.setFocus)
+
+    def _save(self):
+        self.saved.emit(self._idx, self.edit.toPlainText())
+        self.fade_out()
+
+    def _delete(self):
+        self.deleted.emit(self._idx)
+        self.fade_out()
+
+
 # =====================================================================
 #                              Остров
 # =====================================================================
@@ -1211,6 +1565,10 @@ class Island(QWidget):
         self.bri = bri
         self.menu = None
         self.picker = None
+        self.note_editor = None
+        self.clock = ClockTools()
+        self.notes = NoteStore()
+        self.notes_off = 0
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                             | Qt.WindowType.Tool | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -1218,7 +1576,14 @@ class Island(QWidget):
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
 
-        self.mode = "compact"      # compact | expanded | quick | drop
+        self.mode = "compact"      # compact | expanded | drop
+        self.tab = "media"
+        self.tab_dir = 1
+        self.tab_alpha = {t: 0.0 for t in TABS}
+        self.tab_alpha["media"] = 1.0
+        self.hl = Spring(self._tab_rects()[0].left(), 260.0, 24.0)
+        self.seg = Spring(0.0, 260.0, 24.0)
+        self.tm_disp = 0.0
         self.files = []
         self._icons = {}
         self._ext_icons = {}
@@ -1234,6 +1599,7 @@ class Island(QWidget):
         self.notif_cur = None
         self.notif_pm = None
         self.notif_until = 0.0
+        self._test_seen = False
         # загрузки
         self.dl_overlay = False
         self.dl_view = None
@@ -1259,6 +1625,7 @@ class Island(QWidget):
         self._out_since = None
         self._fs_tick = 0
         self._fs_hidden = False
+        self._fade_anim = None
 
         scr = QGuiApplication.primaryScreen()
         try:
@@ -1272,9 +1639,9 @@ class Island(QWidget):
         self._timer.timeout.connect(self._tick)
         self._last = time.monotonic()
 
-        self._clock = QTimer(self)
-        self._clock.timeout.connect(self.update)
-        self._clock.start(1000)
+        self._clock_timer = QTimer(self)
+        self._clock_timer.timeout.connect(self.update)
+        self._clock_timer.start(1000)
 
         self._hover = QTimer(self)
         self._hover.timeout.connect(self._hover_poll)
@@ -1304,8 +1671,8 @@ class Island(QWidget):
         self.update()
 
     def _display(self):
-        if self.mode in ("drop", "quick"):
-            return self.mode
+        if self.mode == "drop":
+            return "drop"
         if self.notif_cur is not None:
             return "notif"
         if self.mode == "expanded":
@@ -1317,22 +1684,29 @@ class Island(QWidget):
     def _dl_h(self):
         return DL_H if (self.dl_overlay and self.dl_view) else 0
 
-    def _quick_h(self):
-        return 240 + (48 if self.bri.available else 0)
+    def _tab_h(self, tab):
+        if tab == "media":
+            return H_EXP + (SHELF_H if self.files else 0)
+        if tab == "quick":
+            return T0 + 88 + 36 + 18 + (48 if self.bri.available else 0)
+        if tab == "timer":
+            return T0 + 196
+        rows = max(1, min(4, len(self.notes.items)))
+        return T0 + rows * 44 + 6 + 38 + 16
 
     def _target_size(self, disp):
         if disp == "expanded":
-            return W_EXP, H_EXP + self._dl_h() + (SHELF_H if self.files else 0)
+            return W_EXP, self._tab_h(self.tab) + self._dl_h()
         if disp == "drop":
             return W_DROP, H_DROP
-        if disp == "quick":
-            return W_EXP, self._quick_h()
         if disp == "notif":
             return W_NOTIF, H_NOTIF
         if disp == "download":
             return W_DL, H_DL
         if self.m["has"]:
             return W_MEDIA, H_MEDIA
+        if self.clock.active():
+            return W_CTIMER, H_CTIMER
         return (W_IDLE_NOTCH if self.notch else W_IDLE), H_IDLE
 
     def _retarget(self):
@@ -1342,13 +1716,31 @@ class Island(QWidget):
         self.sh.target = h
         self.layer_targets = {k: False for k in LAYERS}
         if disp == "compact":
-            self.layer_targets["media" if self.m["has"] else "idle"] = True
+            if self.m["has"]:
+                key = "media"
+            elif self.clock.active():
+                key = "ctimer"
+            else:
+                key = "idle"
+            self.layer_targets[key] = True
         else:
             self.layer_targets[disp] = True
 
     def set_mode(self, mode):
+        if mode == "compact" and self.mode != "compact":
+            self.tab_dir = -1
+            self.tab = "media"
+            self._slider = None
         self.mode = mode
-        if mode == "quick":
+        self._retarget()
+        self._kick()
+
+    def set_tab(self, name):
+        if name == self.tab:
+            return
+        self.tab_dir = 1 if TABS.index(name) > TABS.index(self.tab) else -1
+        self.tab = name
+        if name == "quick":
             self.bri.refresh()
             self._refresh_volume()
         self._retarget()
@@ -1411,11 +1803,18 @@ class Island(QWidget):
             prog = min(1.0, max(0.0, prog))
         return {"name": name, "sub": " · ".join(parts), "prog": prog, "done": False}
 
+    def _timer_finished(self):
+        beep_alarm()
+        self.push_notification({"app": "Таймер", "title": "Таймер завершён", "body": "Время вышло",
+                                "icon": None, "kind": "timer"}, force=True)
+
     def _tick(self):
         now = time.monotonic()
         dt = min(now - self._last, 0.05)
         self._last = now
 
+        if self.clock.t_check(now):
+            self._timer_finished()
         if self.notif_cur is not None and now > self.notif_until:
             self._next_notif()
         self._update_downloads(now)
@@ -1427,15 +1826,30 @@ class Island(QWidget):
         else:
             self.dl_disp = 0.0
 
+        # кольцо таймера плавно «доезжает» до нужного значения
+        ck = self.clock
+        if ck.t_state == "idle":
+            tm_target = 0.0
+        else:
+            tm_target = ck.t_remaining(now) / max(1.0, ck.t_dur)
+        self.tm_disp += (tm_target - self.tm_disp) * min(1.0, dt * 10.0)
+
         self._retarget()
-        moving = False
+        busy = False
         for sp in (self.sw, self.sh):
             sp.step(dt)
             if sp.moving():
-                moving = True
+                busy = True
             else:
                 sp.settle()
-        busy = moving
+        self.hl.target = self._tab_rects()[TABS.index(self.tab)].left()
+        self.seg.target = 0.0 if ck.mode == "timer" else 1.0
+        for sp in (self.hl, self.seg):
+            sp.step(dt)
+            if sp.moving():
+                busy = True
+            else:
+                sp.settle()
         for k in LAYERS:
             t = 1.0 if self.layer_targets[k] else 0.0
             a = self.alpha[k]
@@ -1443,16 +1857,25 @@ class Island(QWidget):
                 busy = True
                 a = min(t, a + dt * 6.5) if t > a else max(t, a - dt * 8.0)
                 self.alpha[k] = a
+        for k in TABS:
+            t = 1.0 if k == self.tab else 0.0
+            a = self.tab_alpha[k]
+            if a != t:
+                busy = True
+                a = min(t, a + dt * 7.5) if t > a else max(t, a - dt * 9.0)
+                self.tab_alpha[k] = a
         disp = self._display()
         dynamic = ((self.m["playing"] and disp in ("compact", "expanded"))
                    or (self.dl_view is not None and disp in ("download", "expanded"))
-                   or disp in ("notif", "quick"))
+                   or (disp == "expanded" and self.tab == "timer" and ck.active())
+                   or disp == "notif")
+        slow = ck.active() and not dynamic
         self._apply_geometry()
         self.update()
-        if not busy and not dynamic:
+        if not busy and not dynamic and not slow:
             self._timer.stop()
         else:
-            self._timer.setInterval(self._frame_ms if busy else 33)
+            self._timer.setInterval(self._frame_ms if busy else (33 if dynamic else 250))
 
     def _apply_geometry(self):
         scr = QGuiApplication.primaryScreen().geometry()
@@ -1465,6 +1888,23 @@ class Island(QWidget):
         g = self.geometry()
         if g.x() != x or g.y() != y or g.width() != w or g.height() != h:
             self.setGeometry(x, y, w, h)
+
+    def _fade_window(self, show):
+        """Плавно показывает или прячет весь остров."""
+        if self._fade_anim is not None:
+            self._fade_anim.stop()
+        if show:
+            self.setWindowOpacity(0.0)
+            self.show()
+        a = QPropertyAnimation(self, b"windowOpacity")
+        a.setDuration(260)
+        a.setStartValue(self.windowOpacity())
+        a.setEndValue(1.0 if show else 0.0)
+        a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if not show:
+            a.finished.connect(self.hide)
+        self._fade_anim = a
+        a.start()
 
     # ------------------------------------------------------------------
     # данные
@@ -1521,8 +1961,10 @@ class Island(QWidget):
     # ------------------------------------------------------------------
     # уведомления
     # ------------------------------------------------------------------
-    def push_notification(self, n):
-        if not self.s["notifications"]:
+    def push_notification(self, n, force=False):
+        if str(n.get("title", "")).startswith("WinIsland тест"):
+            self._test_seen = True
+        if not force and not self.s["notifications"]:
             return
         self.notif_queue.append(n)
         if self.notif_cur is None:
@@ -1537,11 +1979,25 @@ class Island(QWidget):
                 pm = QPixmap(n["icon"])
                 if not pm.isNull():
                     self.notif_pm = pm
-            self.notif_until = time.monotonic() + 5.5 + min(3.0, len(n.get("body", "")) / 60.0)
+            extra = 4.0 if n.get("kind") == "timer" else 0.0
+            self.notif_until = time.monotonic() + 5.5 + extra + min(3.0, len(n.get("body", "")) / 60.0)
         else:
             self.notif_cur = None
             self.notif_pm = None
         self._kick()
+
+    def test_notification(self):
+        """Отправляет тестовое уведомление Windows и проверяет, дошло ли оно до острова."""
+        self._test_seen = False
+        send_test_toast()
+        QTimer.singleShot(7000, self._test_check)
+
+    def _test_check(self):
+        if not self._test_seen:
+            self.push_notification(
+                {"app": "WinIsland", "title": "Тест не дошёл до острова",
+                 "body": "Telegram: включите системные уведомления. Проверьте «Не беспокоить».",
+                 "icon": None, "kind": "info"}, force=True)
 
     # ------------------------------------------------------------------
     # файлы
@@ -1596,48 +2052,68 @@ class Island(QWidget):
                 self.muted = bool(mu)
 
     # ------------------------------------------------------------------
-    # наведение мыши, полноэкранный режим
+    # полноэкранный режим, наведение мыши
     # ------------------------------------------------------------------
     def _foreground_fullscreen(self):
+        """True, если на ГЛАВНОМ мониторе открыто настоящее полноэкранное окно (не просто развёрнутое)."""
         if sys.platform != "win32":
             return False
         try:
             import ctypes
             from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
             if not hwnd:
                 return False
             cls = ctypes.create_unicode_buffer(256)
             user32.GetClassNameW(hwnd, cls, 256)
-            if cls.value in ("WorkerW", "Progman", "Shell_TrayWnd"):
+            if cls.value in ("WorkerW", "Progman", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+                return False
+            style = user32.GetWindowLongW(hwnd, -16)
+            if (style & 0x00C00000) == 0x00C00000:      # есть заголовок окна — обычное окно
+                return False
+            mon = user32.MonitorFromWindow(hwnd, 2)
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                return False
+            if not (mi.dwFlags & 1):                     # не главный монитор
                 return False
             r = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(r))
-            sw = user32.GetSystemMetrics(0)
-            sh = user32.GetSystemMetrics(1)
-            return r.left <= 0 and r.top <= 0 and r.right >= sw and r.bottom >= sh
+            m = mi.rcMonitor
+            return r.left <= m.left and r.top <= m.top and r.right >= m.right and r.bottom >= m.bottom
         except Exception:
             return False
 
+    def _popup_open(self):
+        for w in (self.picker, self.note_editor):
+            if w is not None and w.isVisible():
+                return True
+        return False
+
     def _hover_poll(self):
-        if HIDE_IN_FULLSCREEN:
-            self._fs_tick += 1
-            if self._fs_tick >= 12:
-                self._fs_tick = 0
-                fs = self._foreground_fullscreen()
-                if fs and not self._fs_hidden:
-                    self._fs_hidden = True
-                    self.hide()
-                elif not fs and self._fs_hidden:
-                    self._fs_hidden = False
-                    self.show()
+        self._fs_tick += 1
+        if self._fs_tick >= 6:
+            self._fs_tick = 0
+            want_hide = bool(self.s["hide_fullscreen"]) and self._foreground_fullscreen()
+            if want_hide and not self._fs_hidden:
+                self._fs_hidden = True
+                self._fade_window(False)
+            elif not want_hide and self._fs_hidden:
+                self._fs_hidden = False
+                self._fade_window(True)
         if not self.isVisible():
             return
         now = time.monotonic()
         inside = self.frameGeometry().contains(QCursor.pos())
 
-        if self.mode == "quick" and self._slider is None:
+        if self.mode == "expanded" and self.tab == "quick" and self._slider is None:
             self._vol_tick += 1
             if self._vol_tick >= 8:
                 self._vol_tick = 0
@@ -1649,7 +2125,7 @@ class Island(QWidget):
 
         if self._dragging or self.mode == "drop":
             return
-        picker_open = self.picker is not None and self.picker.isVisible()
+        popup = self._popup_open()
         if inside:
             self._out_since = None
             if self.mode == "compact":
@@ -1663,7 +2139,7 @@ class Island(QWidget):
                         self.set_mode("expanded")
         else:
             self._in_since = None
-            if self.mode in ("expanded", "quick") and not picker_open:
+            if self.mode == "expanded" and not popup:
                 if QGuiApplication.mouseButtons() != Qt.MouseButton.NoButton:
                     self._out_since = None
                 elif self._out_since is None:
@@ -1675,35 +2151,34 @@ class Island(QWidget):
                 self._out_since = None
 
     # ------------------------------------------------------------------
-    # раскладка (координаты внутри блока шириной W_EXP)
+    # раскладки (координаты внутри блока шириной W_EXP)
     # ------------------------------------------------------------------
-    def _layout(self):
+    def _tab_rects(self):
+        x0 = (W_EXP - 210) / 2.0 + 4
+        return [QRectF(x0 + i * 52, 13, 46, 30) for i in range(4)]
+
+    def _mlayout(self):
         W = W_EXP
+        T = T0
         L = {}
-        L["art"] = QRectF(22, 18, 60, 60)
-        L["title"] = QRectF(98, 22, W - 98 - 22 - 30 - 10 - 28, 24)
-        L["artist"] = QRectF(98, 48, W - 98 - 22 - 40, 20)
-        L["gear"] = QRectF(W - 22 - 30, 18, 30, 30)
-        L["eq_x"] = W - 22 - 30 - 10 - 19
-        L["eq_cy"] = 33
-        L["bar"] = QRectF(22, 92, W - 44, 5)
-        L["t_left"] = QRectF(22, 101, 90, 14)
-        L["t_right"] = QRectF(W - 22 - 90, 101, 90, 14)
-        cy = 138
+        L["art"] = QRectF(22, T, 56, 56)
+        L["title"] = QRectF(92, T + 2, W - 92 - 22 - 30, 22)
+        L["artist"] = QRectF(92, T + 28, W - 92 - 22, 20)
+        L["eq_x"] = W - 22 - 19
+        L["eq_cy"] = T + 13
+        L["bar"] = QRectF(22, T + 68, W - 44, 5)
+        L["t_left"] = QRectF(22, T + 76, 90, 14)
+        L["t_right"] = QRectF(W - 22 - 90, T + 76, 90, 14)
+        cy = T + 102
         L["prev"] = QRectF(W / 2 - 80 - 18, cy - 18, 36, 36)
         L["play"] = QRectF(W / 2 - 22, cy - 22, 44, 44)
         L["next"] = QRectF(W / 2 + 80 - 18, cy - 18, 36, 36)
-        L["div1"] = 162
-        L["time"] = QRectF(22, 170, 190, 32)
-        L["date"] = QRectF(22, 202, 190, 16)
-        L["close"] = QRectF(22, 166, 190, 56)
-        L["weather"] = QRectF(W - 22 - 200, 166, 200, 56)
-        y = H_EXP
-        dlh = self._dl_h()
-        if dlh:
-            L["dl"] = QRectF(0, y, W, DL_H)
-            y += dlh
+        L["div1"] = T + 126
+        L["time"] = QRectF(22, T + 132, 190, 30)
+        L["date"] = QRectF(22, T + 162, 190, 16)
+        L["weather"] = QRectF(W - 22 - 200, T + 128, 200, 56)
         if self.files:
+            y = H_EXP
             L["div2"] = y
             L["shelf_title"] = QRectF(22, y + 8, 220, 16)
             L["clear"] = QRectF(W - 22 - 90, y + 8, 90, 16)
@@ -1713,15 +2188,43 @@ class Island(QWidget):
     def _qlayout(self):
         W = W_EXP
         L = {}
-        L["back"] = QRectF(10, 10, 110, 32)
-        L["tiles"] = [QRectF(18 + i * 104, 52, 92, 72) for i in range(4)]
-        L["vol"] = QRectF(22, 142, W - 44, 36)
-        y = 190
+        L["tiles"] = [QRectF(18 + i * 104, T0, 92, 72) for i in range(4)]
+        L["vol"] = QRectF(22, T0 + 88, W - 44, 36)
         if self.bri.available:
-            L["bri"] = QRectF(22, y, W - 44, 36)
-            y += 48
-        cw = (W - 44 - 24) / 4.0
-        L["chips"] = [QRectF(22 + i * (cw + 8), y + 4, cw, 30) for i in range(4)]
+            L["bri"] = QRectF(22, T0 + 136, W - 44, 36)
+        return L
+
+    def _tlayout(self):
+        W = W_EXP
+        T = T0
+        L = {}
+        sx = (W - 220) / 2.0
+        L["seg"] = QRectF(sx, T, 220, 30)
+        L["seg_t"] = QRectF(sx, T, 110, 30)
+        L["seg_s"] = QRectF(sx + 110, T, 110, 30)
+        cy = T + 92
+        L["ring_c"] = QPointF(W / 2.0, cy)
+        L["ring_r"] = 50.0
+        L["btn_l"] = QRectF(36, cy - 30, 60, 60)
+        L["btn_r"] = QRectF(W - 36 - 60, cy - 30, 60, 60)
+        labels = [("−1 мин", ("adj", -1)), ("5 мин", ("set", 5)), ("10 мин", ("set", 10)),
+                  ("15 мин", ("set", 15)), ("30 мин", ("set", 30)), ("+1 мин", ("adj", 1))]
+        cw = 58.0
+        gap = (W - 44 - 6 * cw) / 5.0
+        L["chips"] = [(lab, act, QRectF(22 + i * (cw + gap), T + 152, cw, 30))
+                      for i, (lab, act) in enumerate(labels)]
+        L["info"] = QRectF(22, T + 152, W - 44, 30)
+        return L
+
+    def _nlayout(self):
+        W = W_EXP
+        vis = self.notes.rev()[self.notes_off:self.notes_off + 4]
+        rows = max(1, len(vis))
+        L = {"vis": vis}
+        L["rows"] = [QRectF(22, T0 + i * 44, W - 44, 38) for i in range(len(vis))]
+        L["xs"] = [QRectF(W - 22 - 34, r.top() + 4, 30, 30) for r in L["rows"]]
+        L["empty"] = QRectF(22, T0, W - 44, 38)
+        L["new"] = QRectF(22, T0 + rows * 44 + 6, W - 44, 38)
         return L
 
     def _body_pt(self, pos):
@@ -1730,14 +2233,11 @@ class Island(QWidget):
         ox = (bw - W_EXP) / 2.0
         return QPointF(pos.x() - f - ox, pos.y())
 
-    def _hit(self, pos):
-        pt = self._body_pt(pos)
-        L = self._layout()
+    def _hit_media(self, pt):
+        L = self._mlayout()
         for k in ("prev", "play", "next"):
             if L[k].adjusted(-8, -8, 8, 8).contains(pt):
                 return (k,)
-        if L["gear"].adjusted(-6, -6, 6, 6).contains(pt):
-            return ("gear",)
         if L["bar"].adjusted(-6, -12, 6, 12).contains(pt):
             frac = (pt.x() - L["bar"].left()) / L["bar"].width()
             return ("bar", min(1.0, max(0.0, frac)))
@@ -1749,27 +2249,44 @@ class Island(QWidget):
                     return ("chip", self._shown()[i][0])
         if L["weather"].contains(pt):
             return ("weather",)
-        if L["close"].contains(pt):
-            return ("close",)
         return None
 
-    def _qhit(self, pos):
-        pt = self._body_pt(pos)
+    def _hit_quick(self, pt):
         L = self._qlayout()
-        if L["back"].contains(pt):
-            return ("back",)
-        keys = ("wifi", "bt", "air", "mute")
-        for k, r in zip(keys, L["tiles"]):
+        for k, r in zip(("wifi", "bt", "air", "mute"), L["tiles"]):
             if r.contains(pt):
                 return ("tile", k)
         if L["vol"].adjusted(-4, -6, 4, 6).contains(pt):
             return ("slider", "vol", L["vol"])
         if "bri" in L and L["bri"].adjusted(-4, -6, 4, 6).contains(pt):
             return ("slider", "bri", L["bri"])
-        urls = ("ms-settings:network-wifi", "ms-settings:bluetooth", "ms-settings:sound", "ms-settings:display")
-        for u, r in zip(urls, L["chips"]):
+        return None
+
+    def _hit_timer(self, pt):
+        L = self._tlayout()
+        if L["seg_t"].contains(pt):
+            return ("seg", "timer")
+        if L["seg_s"].contains(pt):
+            return ("seg", "sw")
+        if L["btn_l"].adjusted(-6, -6, 6, 6).contains(pt):
+            return ("left",)
+        if L["btn_r"].adjusted(-6, -6, 6, 6).contains(pt):
+            return ("right",)
+        if self.clock.mode == "timer" and self.clock.t_state == "idle":
+            for _lab, act, r in L["chips"]:
+                if r.contains(pt):
+                    return ("chip", act)
+        return None
+
+    def _hit_notes(self, pt):
+        L = self._nlayout()
+        for (idx, _t), r, xr in zip(L["vis"], L["rows"], L["xs"]):
+            if xr.adjusted(-4, -4, 4, 4).contains(pt):
+                return ("del", idx)
             if r.contains(pt):
-                return ("open", u)
+                return ("open", idx)
+        if L["new"].contains(pt):
+            return ("new",)
         return None
 
     # ------------------------------------------------------------------
@@ -1796,6 +2313,13 @@ class Island(QWidget):
         path.closeSubpath()
         return path
 
+    def _settle_xf(self, p, w, a):
+        """Лёгкое «оседание» содержимого при появлении: от 94% до 100% с центра сверху."""
+        s = 0.94 + 0.06 * a
+        p.translate(w / 2.0, 0)
+        p.scale(s, s)
+        p.translate(-w / 2.0, 0)
+
     def paintEvent(self, _e):
         p = QPainter(self)
         p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
@@ -1818,26 +2342,29 @@ class Island(QWidget):
         if a["media"] > 0.01:
             p.setOpacity(a["media"])
             self._draw_media_compact(p, w)
+        if a["ctimer"] > 0.01:
+            p.setOpacity(a["ctimer"])
+            self._draw_ctimer(p, w)
         if a["drop"] > 0.01:
             p.setOpacity(a["drop"])
             self._draw_drop(p, w)
         if a["notif"] > 0.01 and self.notif_cur is not None:
+            p.save()
             p.setOpacity(a["notif"])
+            self._settle_xf(p, w, a["notif"])
             self._draw_notif(p, w)
-        if a["download"] > 0.01 and self.dl_view:
-            p.setOpacity(a["download"])
-            self._draw_dl(p, QRectF(0, 0, w, DL_H))
-        if a["expanded"] > 0.01:
-            p.setOpacity(a["expanded"])
-            p.save()
-            p.translate(ox, 0)
-            self._draw_expanded(p)
             p.restore()
-        if a["quick"] > 0.01:
-            p.setOpacity(a["quick"])
+        if a["download"] > 0.01 and self.dl_view:
             p.save()
+            p.setOpacity(a["download"])
+            self._settle_xf(p, w, a["download"])
+            self._draw_dl(p, QRectF(0, 0, w, DL_H))
+            p.restore()
+        if a["expanded"] > 0.01:
+            p.save()
+            self._settle_xf(p, w, a["expanded"])
             p.translate(ox, 0)
-            self._draw_quick(p)
+            self._draw_expanded(p, a["expanded"])
             p.restore()
         p.end()
 
@@ -1850,8 +2377,7 @@ class Island(QWidget):
             p.drawPixmap(rect, self.art, QRectF(self.art.rect()))
         else:
             p.fillRect(rect, QColor(44, 44, 48))
-            draw_text(p, rect, "♪", F(int(rect.height() * 0.5)), QColor(255, 255, 255, 110),
-                      AL.AlignCenter, elide=False)
+            icon_tab_media(p, rect.center().x(), rect.center().y(), QColor(255, 255, 255, 110))
         p.restore()
 
     def _draw_eq(self, p, x, cy, maxh, color, playing):
@@ -1881,7 +2407,21 @@ class Island(QWidget):
 
     def _draw_media_compact(self, p, w):
         self._draw_art(p, QRectF(8, (H_MEDIA - 26) / 2, 26, 26), 8)
-        self._draw_eq(p, w - 12 - 19, H_MEDIA / 2, 16, self.accent, self.m["playing"])
+        txt = self.clock.mini_text()
+        if txt:
+            draw_text(p, QRectF(w - 14 - 70, 0, 70, H_MEDIA), txt, F(14, QFont.Weight.DemiBold),
+                      QColor(*ORANGE), AL.AlignRight | AL.AlignVCenter, elide=False)
+        else:
+            self._draw_eq(p, w - 12 - 19, H_MEDIA / 2, 16, self.accent, self.m["playing"])
+
+    def _draw_ctimer(self, p, w):
+        ck = self.clock
+        col = QColor(*ORANGE)
+        icon_tab_timer(p, 22, H_CTIMER / 2.0, col)
+        txt = ck.mini_text() or "00:00"
+        c = col if (ck.t_state != "paused") else QColor(ORANGE[0], ORANGE[1], ORANGE[2], 140)
+        draw_text(p, QRectF(w - 16 - 90, 0, 90, H_CTIMER), txt, F(15, QFont.Weight.DemiBold), c,
+                  AL.AlignRight | AL.AlignVCenter, elide=False)
 
     def _draw_drop(self, p, w):
         cx = w / 2.0
@@ -1899,6 +2439,7 @@ class Island(QWidget):
         n = self.notif_cur
         app = n.get("app", "")
         r = QRectF(16, 14, 50, 50)
+        kind = n.get("kind")
         if self.notif_pm is not None:
             p.save()
             path = QPainterPath()
@@ -1906,16 +2447,28 @@ class Island(QWidget):
             p.setClipPath(path, Qt.ClipOperation.IntersectClip)
             p.drawPixmap(r, self.notif_pm, QRectF(self.notif_pm.rect()))
             p.restore()
+        elif kind == "timer":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(*ORANGE))
+            p.drawRoundedRect(r, 14, 14)
+            icon_tab_timer(p, r.center().x(), r.center().y(), QColor(255, 255, 255))
         else:
-            col = QColor(0, 136, 204) if app == "Telegram" else QColor.fromHsv(abs(hash(app)) % 360, 150, 215)
+            if app == "Telegram":
+                col = QColor(0, 136, 204)
+            elif app == "WhatsApp":
+                col = QColor(37, 211, 102)
+            else:
+                col = QColor.fromHsv(abs(hash(app)) % 360, 150, 215)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(col)
             p.drawRoundedRect(r, 14, 14)
             draw_text(p, r, (app[:1] or "?").upper(), F(24, QFont.Weight.DemiBold), QColor(255, 255, 255),
                       AL.AlignCenter, elide=False)
         tw = w - 80 - 16
-        draw_text(p, QRectF(80, 11, tw, 14), app.upper(), F(10, QFont.Weight.DemiBold),
+        draw_text(p, QRectF(80, 11, tw - 56, 14), app.upper(), F(10, QFont.Weight.DemiBold),
                   QColor(255, 255, 255, 120))
+        draw_text(p, QRectF(w - 16 - 54, 11, 54, 14), "сейчас", F(10), QColor(255, 255, 255, 90),
+                  AL.AlignRight | AL.AlignVCenter)
         title = n.get("title") or app
         draw_text(p, QRectF(80, 25, tw, 22), title, F(15, QFont.Weight.DemiBold), QColor(255, 255, 255))
         draw_text(p, QRectF(80, 47, tw, 20), n.get("body", ""), F(13), QColor(255, 255, 255, 170))
@@ -1938,8 +2491,8 @@ class Island(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 45), 3.0))
         p.drawEllipse(QPointF(cx, cy), r, r)
         ring = QRectF(cx - r, cy - r, 2 * r, 2 * r)
-        green = QColor(48, 209, 88)
-        blue = QColor(10, 132, 255)
+        green = QColor(*GREEN)
+        blue = QColor(*BLUE)
         if done:
             p.setPen(QPen(green, 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             p.drawEllipse(QPointF(cx, cy), r, r)
@@ -1966,8 +2519,56 @@ class Island(QWidget):
         draw_text(p, QRectF(x + 54, y + 8, tw, 18), v["name"], F(13, QFont.Weight.DemiBold), white)
         draw_text(p, QRectF(x + 54, y + 27, tw, 16), v["sub"], F(11), gray)
 
-    def _draw_expanded(self, p):
-        L = self._layout()
+    # ---------- раскрытый остров: панель вкладок + содержимое ----------
+    def _draw_tabbar(self, p, base):
+        W = W_EXP
+        p.setOpacity(base)
+        cont = QRectF((W - 210) / 2.0, 9, 210, 38)
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1))
+        p.setBrush(QColor(255, 255, 255, 24))
+        p.drawRoundedRect(cont, 19, 19)
+        rects = self._tab_rects()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 238))
+        p.drawRoundedRect(QRectF(self.hl.x, 13, 46, 30), 15, 15)
+        fns = (icon_tab_media, icon_tab_quick, icon_tab_timer, icon_tab_notes)
+        dark = QColor(12, 12, 14)
+        light = QColor(255, 255, 255)
+        for r, fn in zip(rects, fns):
+            t = 1.0 - abs(self.hl.x - r.left()) / 52.0
+            fn(p, r.center().x(), r.center().y(), lerp_color(light, dark, t))
+        if self.clock.active():
+            r = rects[2]
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(*ORANGE))
+            p.drawEllipse(QPointF(r.right() - 8, r.top() + 7), 2.8, 2.8)
+
+    def _draw_expanded(self, p, base):
+        self._draw_tabbar(p, base)
+        drawers = {"media": self._draw_tab_media, "quick": self._draw_tab_quick,
+                   "timer": self._draw_tab_timer, "notes": self._draw_tab_notes}
+        for t in TABS:
+            ta = smooth(self.tab_alpha[t])
+            if ta <= 0.01:
+                continue
+            slide = (1.0 - ta) * 18.0 * self.tab_dir
+            off = slide if t == self.tab else -slide
+            p.save()
+            p.translate(off, 0)
+            p.setOpacity(base * ta)
+            drawers[t](p)
+            p.restore()
+        if self._dl_h() and self.dl_view:
+            p.save()
+            p.setOpacity(base)
+            y = self.height() - DL_H
+            p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+            p.drawLine(QPointF(22, y), QPointF(W_EXP - 22, y))
+            self._draw_dl(p, QRectF(0, y, W_EXP, DL_H))
+            p.restore()
+
+    def _draw_tab_media(self, p):
+        L = self._mlayout()
         m = self.m
         has = m["has"]
         white = QColor(255, 255, 255)
@@ -1981,12 +2582,6 @@ class Island(QWidget):
         draw_text(p, L["artist"], artist, F(14), gray)
         if has:
             self._draw_eq(p, L["eq_x"], L["eq_cy"], 18, self.accent, m["playing"])
-
-        g = L["gear"]
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 30))
-        p.drawEllipse(g)
-        icon_gear(p, g.center().x(), g.center().y(), white)
 
         dur = m["dur"]
         bar = L["bar"]
@@ -2014,39 +2609,35 @@ class Island(QWidget):
         p.setPen(QPen(QColor(255, 255, 255, 28), 1))
         p.drawLine(QPointF(22, L["div1"]), QPointF(W - 22, L["div1"]))
         now = datetime.datetime.now()
-        draw_text(p, L["time"], now.strftime("%H:%M"), F(26, QFont.Weight.DemiBold), white)
+        draw_text(p, L["time"], now.strftime("%H:%M"), F(24, QFont.Weight.DemiBold), white)
         draw_text(p, L["date"], ru_date(now), F(12), gray)
 
         right = W - 22
+        ty = T0 + 132
         wd = self.wx
         if wd:
             t = int(round(wd["temp"]))
             ts = "0°" if t == 0 else "%+d°" % t
-            tf = F(26, QFont.Weight.DemiBold)
+            tf = F(24, QFont.Weight.DemiBold)
             p.setFont(tf)
             tw = p.fontMetrics().horizontalAdvance(ts)
-            draw_text(p, QRectF(right - tw - 2, 170, tw + 4, 32), ts, tf, white,
+            draw_text(p, QRectF(right - tw - 2, ty, tw + 4, 30), ts, tf, white,
                       AL.AlignRight | AL.AlignVCenter, elide=False)
-            draw_text(p, QRectF(right - tw - 2 - 40, 170, 36, 32), wd["emoji"], EF(24), white,
+            draw_text(p, QRectF(right - tw - 2 - 40, ty, 36, 30), wd["emoji"], EF(22), white,
                       AL.AlignCenter, elide=False)
             info = wd["city"] + (" · " if wd["city"] and wd["desc"] else "") + wd["desc"]
-            draw_text(p, QRectF(right - 230, 202, 230, 16), info, F(12), gray,
+            draw_text(p, QRectF(right - 230, ty + 30, 230, 16), info, F(12), gray,
                       AL.AlignRight | AL.AlignVCenter)
         else:
-            draw_text(p, QRectF(right - 200, 170, 200, 32), "Погода загружается…", F(12), gray,
+            draw_text(p, QRectF(right - 200, ty, 200, 30), "Погода загружается…", F(12), gray,
                       AL.AlignRight | AL.AlignVCenter)
-
-        if "dl" in L:
-            p.setPen(QPen(QColor(255, 255, 255, 28), 1))
-            p.drawLine(QPointF(22, L["dl"].top()), QPointF(W - 22, L["dl"].top()))
-            self._draw_dl(p, L["dl"])
 
         if self.files:
             p.setPen(QPen(QColor(255, 255, 255, 28), 1))
             p.drawLine(QPointF(22, L["div2"]), QPointF(W - 22, L["div2"]))
             draw_text(p, L["shelf_title"], "Файлы на полке: %d" % len(self.files),
                       F(12, QFont.Weight.DemiBold), gray)
-            draw_text(p, L["clear"], "Очистить", F(12, QFont.Weight.DemiBold), QColor(10, 132, 255),
+            draw_text(p, L["clear"], "Очистить", F(12, QFont.Weight.DemiBold), QColor(*BLUE),
                       AL.AlignRight | AL.AlignVCenter)
             for (idx, path), r in zip(self._shown(), L["chips"]):
                 pm = self._icon(path)
@@ -2055,29 +2646,31 @@ class Island(QWidget):
                 draw_text(p, QRectF(r.left(), r.top() + 38, r.width(), 15), os.path.basename(path),
                           F(11), QColor(255, 255, 255, 200), AL.AlignCenter)
 
-    def _draw_slider(self, p, rect, frac, emoji, enabled=True):
+    def _draw_slider(self, p, rect, frac, kind, enabled=True, muted=False):
         rr = rect.height() / 2.0
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(255, 255, 255, 40 if enabled else 22))
-        p.drawRoundedRect(rect, rr, rr)
+        track = QPainterPath()
+        track.addRoundedRect(rect, rr, rr)
+        p.fillPath(track, QColor(255, 255, 255, 40 if enabled else 22))
+        fw = 0.0
         if frac is not None and enabled:
-            fw = max(rect.height(), rect.width() * max(0.0, min(1.0, frac)))
-            p.setBrush(QColor(255, 255, 255, 238))
-            p.drawRoundedRect(QRectF(rect.left(), rect.top(), fw, rect.height()), rr, rr)
-        draw_text(p, QRectF(rect.left() + 10, rect.top(), 30, rect.height()), emoji, EF(17),
-                  QColor(255, 255, 255), AL.AlignCenter, elide=False)
+            fw = rect.width() * max(0.0, min(1.0, frac))
+            p.save()
+            p.setClipPath(track, Qt.ClipOperation.IntersectClip)
+            p.fillRect(QRectF(rect.left(), rect.top(), fw, rect.height()), QColor(255, 255, 255, 238))
+            p.restore()
+        covered = fw > 34
+        col = QColor(12, 12, 14) if covered else QColor(255, 255, 255, 255 if enabled else 90)
+        cx, cy = rect.left() + 22, rect.center().y()
+        if kind == "vol":
+            icon_speaker(p, cx, cy, col, muted)
+        else:
+            icon_sun(p, cx, cy, col)
         if not enabled:
             draw_text(p, QRectF(rect.left() + 44, rect.top(), rect.width() - 54, rect.height()),
                       "недоступно", F(12), QColor(255, 255, 255, 90))
 
-    def _draw_quick(self, p):
+    def _draw_tab_quick(self, p):
         L = self._qlayout()
-        white = QColor(255, 255, 255)
-        W = W_EXP
-        draw_text(p, L["back"], "‹  Назад", F(14, QFont.Weight.DemiBold), QColor(10, 132, 255))
-        draw_text(p, QRectF(0, 10, W, 32), "Быстрые настройки", F(15, QFont.Weight.DemiBold), white,
-                  AL.AlignCenter)
-
         st = self.sysst
         air = not st.get("any_on", True)
         tiles = [("wifi", "Wi-Fi", bool(st.get("wifi")), st.get("wifi") is not None),
@@ -2090,33 +2683,146 @@ class Island(QWidget):
                 p.setBrush(QColor(255, 255, 255, 245))
             else:
                 p.setBrush(QColor(255, 255, 255, 34 if enabled else 16))
-            p.drawRoundedRect(r, 20, 20)
-            ic = QColor(0, 0, 0) if active else QColor(255, 255, 255, 255 if enabled else 90)
+            p.drawRoundedRect(r, 22, 22)
+            ic = QColor(12, 12, 14) if active else QColor(255, 255, 255, 255 if enabled else 90)
             cx, ty = r.center().x(), r.top()
             if key == "wifi":
                 icon_wifi(p, cx, ty + 36, ic)
             elif key == "bt":
                 icon_bt(p, cx, ty + 27, ic)
             elif key == "air":
-                draw_text(p, QRectF(r.left(), ty + 8, r.width(), 34), "✈", SF(26), ic, AL.AlignCenter,
-                          elide=False)
+                icon_airplane(p, cx, ty + 26, ic)
             else:
-                draw_text(p, QRectF(r.left(), ty + 8, r.width(), 34), "🔇" if self.muted else "🔊", EF(24),
-                          ic, AL.AlignCenter, elide=False)
+                icon_speaker(p, cx, ty + 26, ic, self.muted)
             draw_text(p, QRectF(r.left(), ty + 48, r.width(), 18), label, F(11, QFont.Weight.DemiBold),
-                      QColor(0, 0, 0) if active else QColor(255, 255, 255, 255 if enabled else 90),
+                      QColor(12, 12, 14) if active else QColor(255, 255, 255, 255 if enabled else 90),
                       AL.AlignCenter)
-
-        self._draw_slider(p, L["vol"], self.volv, "🔇" if self.muted else "🔊", self.vol.available)
+        self._draw_slider(p, L["vol"], self.volv, "vol", self.vol.available, self.muted)
         if "bri" in L:
             bv = (self.bri.value / 100.0) if self.bri.value is not None else None
-            self._draw_slider(p, L["bri"], bv, "☀️", True)
-        labels = ("Wi-Fi", "Bluetooth", "Звук", "Экран")
-        for lab, r in zip(labels, L["chips"]):
+            self._draw_slider(p, L["bri"], bv, "bri", True)
+
+    def _draw_round_btn(self, p, rect, label, kind, enabled=True):
+        cols = {"gray": (255, 255, 255), "green": GREEN, "orange": ORANGE, "red": RED}
+        c = cols[kind]
+        k = 1.0 if enabled else 0.4
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(c[0], c[1], c[2], int((40 if kind == "gray" else 62) * k)))
+        p.drawEllipse(rect)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(c[0], c[1], c[2], int((46 if kind == "gray" else 90) * k)), 1.2))
+        p.drawEllipse(rect.adjusted(-3.5, -3.5, 3.5, 3.5))
+        tc = QColor(255, 255, 255, int(255 * k)) if kind == "gray" else QColor(c[0], c[1], c[2], int(255 * k))
+        draw_text(p, rect, label, F(14, QFont.Weight.DemiBold), tc, AL.AlignCenter, elide=False)
+
+    def _draw_ring(self, p, c, r, frac, color):
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 34), 5.0))
+        p.drawEllipse(c, r, r)
+        if frac > 0.003:
+            p.setPen(QPen(color, 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), 90 * 16, int(-360.0 * 16 * min(1.0, frac)))
+
+    def _draw_tab_timer(self, p):
+        L = self._tlayout()
+        ck = self.clock
+        now = time.monotonic()
+        white = QColor(255, 255, 255)
+        gray = QColor(255, 255, 255, 140)
+        orange = QColor(*ORANGE)
+
+        # переключатель «Таймер | Секундомер» с плавной «таблеткой»
+        seg = L["seg"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 24))
+        p.drawRoundedRect(seg, 15, 15)
+        sx = seg.left() + 2 + self.seg.x * 108
+        p.setBrush(QColor(255, 255, 255, 64))
+        p.drawRoundedRect(QRectF(sx, seg.top() + 2, 106, 26), 13, 13)
+        draw_text(p, L["seg_t"], "Таймер", F(13, QFont.Weight.DemiBold),
+                  white if ck.mode == "timer" else gray, AL.AlignCenter)
+        draw_text(p, L["seg_s"], "Секундомер", F(13, QFont.Weight.DemiBold),
+                  white if ck.mode == "sw" else gray, AL.AlignCenter)
+
+        c, r = L["ring_c"], L["ring_r"]
+        rect_t = QRectF(c.x() - r + 6, c.y() - 22, 2 * r - 12, 44)
+        if ck.mode == "timer":
+            rem = ck.t_remaining(now)
+            self._draw_ring(p, c, r, self.tm_disp, orange)
+            txt = fmt_clock(math.ceil(rem - 1e-6))
+            draw_text(p, rect_t, txt, F(30 if len(txt) <= 5 else 22, QFont.Weight.DemiBold),
+                      white if ck.t_state != "paused" else gray, AL.AlignCenter, elide=False)
+            self._draw_round_btn(p, L["btn_l"], "Отмена", "gray", ck.t_state != "idle")
+            if ck.t_state == "running":
+                self._draw_round_btn(p, L["btn_r"], "Пауза", "orange")
+            elif ck.t_state == "paused":
+                self._draw_round_btn(p, L["btn_r"], "Далее", "green")
+            else:
+                self._draw_round_btn(p, L["btn_r"], "Старт", "green")
+            if ck.t_state == "idle":
+                for lab, act, rr in L["chips"]:
+                    sel = act[0] == "set" and int(ck.t_dur) == act[1] * 60
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(255, 255, 255, 70 if sel else 26))
+                    p.drawRoundedRect(rr, 15, 15)
+                    draw_text(p, rr, lab, F(12, QFont.Weight.DemiBold), white if sel else QColor(255, 255, 255, 200),
+                              AL.AlignCenter, elide=False)
+            else:
+                end = datetime.datetime.now() + datetime.timedelta(seconds=rem)
+                info = ("Закончится в " + end.strftime("%H:%M")) if ck.t_state == "running" else "Пауза"
+                draw_text(p, L["info"], info, F(13), gray, AL.AlignCenter)
+        else:
+            el = ck.sw_elapsed(now)
+            self._draw_ring(p, c, r, (el % 60.0) / 60.0 if el > 0 else 0.0, orange)
+            draw_text(p, rect_t, fmt_sw(el), F(20, QFont.Weight.DemiBold), white, AL.AlignCenter, elide=False)
+            running = ck.sw_state == "running"
+            if running:
+                self._draw_round_btn(p, L["btn_l"], "Круг", "gray")
+                self._draw_round_btn(p, L["btn_r"], "Стоп", "red")
+            else:
+                self._draw_round_btn(p, L["btn_l"], "Сброс", "gray", el > 0)
+                self._draw_round_btn(p, L["btn_r"], "Старт", "green")
+            if ck.laps:
+                prev = ck.laps[-2] if len(ck.laps) > 1 else 0.0
+                info = "Круг %d · %s" % (len(ck.laps), fmt_sw(ck.laps[-1] - prev))
+            else:
+                info = "Нажмите «Старт»" if el <= 0 else "Нажмите «Круг», чтобы отметить круг"
+            draw_text(p, L["info"], info, F(13), gray, AL.AlignCenter)
+
+    def _draw_tab_notes(self, p):
+        L = self._nlayout()
+        white = QColor(255, 255, 255)
+        gray = QColor(255, 255, 255, 140)
+        if not L["vis"]:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 16))
+            p.drawRoundedRect(L["empty"], 16, 16)
+            draw_text(p, L["empty"], "Заметок пока нет", F(14), gray, AL.AlignCenter)
+        for (idx, text), r, xr in zip(L["vis"], L["rows"], L["xs"]):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 255, 255, 26))
-            p.drawRoundedRect(r, 15, 15)
-            draw_text(p, r, lab, F(12, QFont.Weight.DemiBold), QColor(10, 132, 255), AL.AlignCenter)
+            p.drawRoundedRect(r, 16, 16)
+            first = text.strip().split("\n")[0].strip() or "Пустая заметка"
+            draw_text(p, QRectF(r.left() + 16, r.top(), r.width() - 16 - 44, r.height()), first,
+                      F(14), white)
+            p.setBrush(QColor(255, 255, 255, 30))
+            p.drawEllipse(xr.adjusted(4, 4, -4, -4))
+            _stroke(p, QColor(255, 255, 255, 200), 1.6)
+            c = xr.center()
+            p.drawLine(QPointF(c.x() - 3.2, c.y() - 3.2), QPointF(c.x() + 3.2, c.y() + 3.2))
+            p.drawLine(QPointF(c.x() - 3.2, c.y() + 3.2), QPointF(c.x() + 3.2, c.y() - 3.2))
+        nb = L["new"]
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(BLUE[0], BLUE[1], BLUE[2], 50))
+        p.drawRoundedRect(nb, 19, 19)
+        blue = QColor(*BLUE)
+        _stroke(p, blue, 2.0)
+        cx = nb.center().x() - 62
+        cy = nb.center().y()
+        p.drawLine(QPointF(cx - 5, cy), QPointF(cx + 5, cy))
+        p.drawLine(QPointF(cx, cy - 5), QPointF(cx, cy + 5))
+        draw_text(p, QRectF(cx + 12, nb.top(), 140, nb.height()), "Новая заметка",
+                  F(14, QFont.Weight.DemiBold), blue)
 
     # ------------------------------------------------------------------
     # мышь
@@ -2156,25 +2862,24 @@ class Island(QWidget):
         if disp in ("compact", "download"):
             self.set_mode("expanded")
             return
-        if disp == "quick":
-            hit = self._qhit(pos)
-            if not hit:
-                return
-            k = hit[0]
-            if k == "back":
-                self.set_mode("expanded")
-            elif k == "open":
-                self._open_uri(hit[1])
-            elif k == "slider":
-                self._slider = hit[1]
-                self._slider_rect = hit[2]
-                self._slider_set(hit[1], hit[2], pos.x())
-            elif k == "tile":
-                self._tile_action(hit[1])
-            return
         if disp != "expanded":
             return
-        hit = self._hit(pos)
+        pt = self._body_pt(pos)
+        for i, r in enumerate(self._tab_rects()):
+            if r.adjusted(-3, -3, 3, 3).contains(pt):
+                self.set_tab(TABS[i])
+                return
+        if self.tab == "media":
+            self._click_media(self._hit_media(pt), e)
+        elif self.tab == "quick":
+            self._click_quick(self._hit_quick(pt), pos)
+        elif self.tab == "timer":
+            self._click_timer(self._hit_timer(pt))
+        else:
+            self._click_notes(self._hit_notes(pt))
+        self.update()
+
+    def _click_media(self, hit, e):
         if not hit:
             return
         k = hit[0]
@@ -2198,13 +2903,63 @@ class Island(QWidget):
             self.clear_files()
         elif k == "chip":
             self._press = (hit[1], e.globalPosition().toPoint())
-        elif k == "gear":
-            self.set_mode("quick")
         elif k == "weather":
             self.open_city_picker()
-        elif k == "close":
-            self.set_mode("compact")
-        self.update()
+
+    def _click_quick(self, hit, pos):
+        if not hit:
+            return
+        if hit[0] == "slider":
+            self._slider = hit[1]
+            self._slider_rect = hit[2]
+            self._slider_set(hit[1], hit[2], pos.x())
+        elif hit[0] == "tile":
+            self._tile_action(hit[1])
+
+    def _click_timer(self, hit):
+        if not hit:
+            return
+        ck = self.clock
+        now = time.monotonic()
+        k = hit[0]
+        if k == "seg":
+            ck.mode = hit[1]
+        elif ck.mode == "timer":
+            if k == "right":
+                if ck.t_state == "idle":
+                    self.tm_disp = 0.0           # кольцо красиво «заполняется» при старте
+                    ck.t_start(now)
+                elif ck.t_state == "running":
+                    ck.t_pause(now)
+                else:
+                    ck.t_start(now)
+            elif k == "left":
+                if ck.t_state != "idle":
+                    ck.t_cancel()
+            elif k == "chip":
+                if hit[1][0] == "adj":
+                    ck.t_adjust(hit[1][1])
+                else:
+                    ck.t_set(hit[1][1])
+        else:
+            if k == "right":
+                ck.sw_toggle(now)
+            elif k == "left":
+                ck.sw_secondary(now)
+        self._kick()
+
+    def _click_notes(self, hit):
+        if not hit:
+            return
+        k = hit[0]
+        if k == "new":
+            self.open_note(-1)
+        elif k == "open":
+            self.open_note(hit[1])
+        elif k == "del":
+            self.notes.remove(hit[1])
+            self.notes_off = max(0, min(self.notes_off, len(self.notes.items) - 4))
+            self._kick()
 
     def _tile_action(self, key):
         st = self.sysst
@@ -2227,6 +2982,13 @@ class Island(QWidget):
             self.muted = not self.muted
             self.vol.set_mute(self.muted)
         self.update()
+
+    def wheelEvent(self, e):
+        if self._display() == "expanded" and self.tab == "notes":
+            step = -1 if e.angleDelta().y() > 0 else 1
+            mx = max(0, len(self.notes.items) - 4)
+            self.notes_off = max(0, min(mx, self.notes_off + step))
+            self.update()
 
     def mouseMoveEvent(self, e):
         if self._slider is not None and (e.buttons() & Qt.MouseButton.LeftButton):
@@ -2264,7 +3026,7 @@ class Island(QWidget):
         self._dragging = False
 
     # ------------------------------------------------------------------
-    # выбор города
+    # выбор города и заметки
     # ------------------------------------------------------------------
     def open_city_picker(self):
         if self.picker is None:
@@ -2283,6 +3045,32 @@ class Island(QWidget):
         self.wx = None
         self.wsrc.use_auto()
         self.update()
+
+    def open_note(self, idx):
+        if self.note_editor is None:
+            self.note_editor = NoteEditor()
+            self.note_editor.saved.connect(self._note_saved)
+            self.note_editor.deleted.connect(self._note_deleted)
+        text = self.notes.items[idx] if 0 <= idx < len(self.notes.items) else ""
+        g = self.geometry()
+        self.note_editor.open_for(idx, text, g.center().x(), g.bottom() + 12)
+
+    def _note_saved(self, idx, text):
+        text = text.strip()
+        if idx >= 0:
+            if text:
+                self.notes.update(idx, text)
+            else:
+                self.notes.remove(idx)
+        elif text:
+            self.notes.add(text)
+        self.notes_off = 0
+        self._kick()
+
+    def _note_deleted(self, idx):
+        self.notes.remove(idx)
+        self.notes_off = 0
+        self._kick()
 
     # ------------------------------------------------------------------
     # перетаскивание файлов НА остров
@@ -2309,6 +3097,8 @@ class Island(QWidget):
             e.acceptProposedAction()
         self._in_since = None
         self._out_since = None
+        self.tab = "media"
+        self.tab_alpha = {t: (1.0 if t == "media" else 0.0) for t in TABS}
         self.set_mode("expanded")
 
 
@@ -2397,6 +3187,13 @@ def build_menu(app, island, settings, weather):
     a_decor.toggled.connect(lambda v: (settings.__setitem__("notch_decor", bool(v)), island.update()))
     sub_look.addAction(a_decor)
 
+    # --- полноэкранный режим ---
+    a_fs = QAction("Скрывать в полноэкранных приложениях", menu)
+    a_fs.setCheckable(True)
+    a_fs.setChecked(bool(settings["hide_fullscreen"]))
+    a_fs.toggled.connect(lambda v: settings.__setitem__("hide_fullscreen", bool(v)))
+    menu.addAction(a_fs)
+
     # --- задержка закрытия ---
     sub_delay = menu.addMenu("Закрывать после ухода мыши")
     dgrp = QActionGroup(sub_delay)
@@ -2409,13 +3206,22 @@ def build_menu(app, island, settings, weather):
         a.triggered.connect(lambda _c=False, s=sec: settings.__setitem__("close_delay", s))
         dgrp.addAction(a)
         sub_delay.addAction(a)
+    menu.addSeparator()
 
-    # --- функции ---
+    # --- уведомления и загрузки ---
     a_notif = QAction("Показывать уведомления Windows (Telegram и др.)", menu)
     a_notif.setCheckable(True)
     a_notif.setChecked(bool(settings["notifications"]))
     a_notif.toggled.connect(lambda v: settings.__setitem__("notifications", bool(v)))
     menu.addAction(a_notif)
+
+    a_test = QAction("Проверить уведомления (отправить тест)", menu)
+    a_test.triggered.connect(island.test_notification)
+    menu.addAction(a_test)
+
+    a_nset = QAction("Параметры уведомлений Windows…", menu)
+    a_nset.triggered.connect(lambda: island._open_uri("ms-settings:notifications"))
+    menu.addAction(a_nset)
 
     a_dl = QAction("Показывать загрузки файлов", menu)
     a_dl.setCheckable(True)
@@ -2423,20 +3229,16 @@ def build_menu(app, island, settings, weather):
     a_dl.toggled.connect(lambda v: settings.__setitem__("downloads", bool(v)))
     menu.addAction(a_dl)
 
-    a_city = QAction("Выбрать город для погоды…", menu)
-    a_city.triggered.connect(island.open_city_picker)
-    menu.addAction(a_city)
-    menu.addSeparator()
-
     ext_dir = os.path.join(app_dir(), "browser_extension")
     if os.path.isdir(ext_dir):
         a_ext = QAction("Папка расширения для браузера (точные загрузки)", menu)
         a_ext.triggered.connect(lambda: os.startfile(ext_dir))
         menu.addAction(a_ext)
-    a_nset = QAction("Параметры уведомлений Windows…", menu)
-    a_nset.triggered.connect(lambda: island._open_uri("ms-settings:notifications"))
-    menu.addAction(a_nset)
     menu.addSeparator()
+
+    a_city = QAction("Выбрать город для погоды…", menu)
+    a_city.triggered.connect(island.open_city_picker)
+    menu.addAction(a_city)
 
     act_auto = QAction("Запускать вместе с Windows", menu)
     act_auto.setCheckable(True)

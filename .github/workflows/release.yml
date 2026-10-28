@@ -1,13 +1,31 @@
-name: Сборка WinIsland.exe
-# Запускается, когда вы создаёте метку версии, например v2.0.0
+name: Выпуск версии
+# Запускается, когда вы выкладываете метку версии, например v2.1.0
+# (проще всего — двойным кликом по git_release.bat)
 on:
   push:
     tags: ["v*"]
 permissions:
   contents: write
 jobs:
-  build:
+  # 1) Всегда: создаёт релиз и прикладывает архив с программой.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Архив с программой
+        run: git archive --format=zip --prefix=WinIsland/ -o WinIsland-source.zip HEAD
+      - name: Создание релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WinIsland-source.zip
+          generate_release_notes: true
+
+  # 2) Дополнительно: пробует собрать готовый WinIsland.exe.
+  #    Если сборка не получится — релиз из шага 1 всё равно останется.
+  build-exe:
+    needs: release
     runs-on: windows-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +42,7 @@ jobs:
           --collect-submodules pycaw --collect-submodules comtypes
           --hidden-import screen_brightness_control
           island.py
-      - name: Архив для скачивания
+      - name: Архив с exe
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path pack | Out-Null
@@ -32,8 +50,7 @@ jobs:
           Copy-Item -Recurse browser_extension pack\browser_extension
           Copy-Item README.md pack\
           Compress-Archive -Path pack\* -DestinationPath WinIsland-windows.zip
-      - name: Публикация релиза
+      - name: Добавить exe в релиз
         uses: softprops/action-gh-release@v2
         with:
           files: WinIsland-windows.zip
-          generate_release_notes: true
