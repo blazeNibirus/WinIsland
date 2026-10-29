@@ -8,3 +8,5 @@ winrt-Windows.Devices.Radios
 pycaw
 comtypes
 screen-brightness-control
+winrt-Windows.Devices.Bluetooth
+winrt-Windows.Devices.Enumeration
